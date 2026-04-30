@@ -1,20 +1,15 @@
 #include "yolo_trt.h"
-
+#include <iostream>
 #include <NvInfer.h>
 #include <cuda_runtime_api.h>
 #include <NvInferPlugin.h>
-#include <thread>
-#include <mutex>
-#include <condition_variable>
-#include <queue>
-#include <atomic>
 #include <fstream>
 #include <filesystem>
 
 #include "preprocess.h"
 #include "NMSProcessor.h"
 
-namespace fs = std::filesystem;
+
 
 
 namespace {
@@ -47,93 +42,6 @@ namespace {
     template <typename T>
     using PinnedVector = std::vector<T, CudaPinnedAllocator<T>>;
 
-    struct PipelineData {
-        std::vector<cv::Mat> frames;
-        std::vector<yolo::BatchResult> dets;
-        std::vector<float> prof;
-        double batch_time = 0.0;
-        bool is_last = false;
-    };
-
-    // 线程安全的阻塞队列
-    template <typename T>
-    class SafeQueue {
-    private:
-        std::queue<T> q;
-        std::mutex m;
-        std::condition_variable cv_push, cv_pop;
-        size_t max_size;
-        bool stop_flag = false;
-    public:
-        SafeQueue(size_t max_size = 3) : max_size(max_size) {} // 队列长度设为3足以缓冲，太大吃内存
-
-        // void push(T val) {
-        //     std::unique_lock<std::mutex> lock(m);
-        //     cv_push.wait(lock, [this] { return q.size() < max_size || stop_flag; }); // 等待队列有空间或者收到停止信号
-        //     if (stop_flag) return;
-        //     q.push(std::move(val)); // 等待成功则进行push
-        //     cv_pop.notify_one(); // 通知在等待消费的线程
-        // }
-
-
-        // 支持右值，避免不必要的拷贝
-        bool push (T&& val){
-            /*
-            尝试获得互斥锁，如果没有其他线程持有锁，则成功获得锁，并继续执行后续代码；
-            如果其他线程已经持有锁，那么当前线程就会阻塞，什么都做不了，这个线程处于等待锁的状态，知道它获得锁。
-            */
-            std::unique_lock<std::mutex> lock(m);
-            /*
-            只有成功获得锁之后，才会去检查lambda函数，如果条件不满足，线程就会释放锁，进入沉睡，如果条件满足就继续执行后续代码。
-
-            处于睡眠状态（Sleep）的线程，是不消耗 CPU 资源的，它也完全失去了执行代码的能力。 
-            它根本无法去检查那个 lambda 表达式（q.size() < max_size）是否已经变成了 true。
-            它就像一个深度昏迷的人。如果没人唤醒就一直睡下去，即使条件已经满足了也不会自己醒来。
-            这个时候需要通过cv_push.notify_one()来唤醒它，否则他就一直睡下去，这就是死锁。
-            */
-            cv_push.wait(lock, [this] {return q.size() < max_size || stop_flag;});
-
-            if (stop_flag) return false;
-
-            q.push(std::move(val));
-            lock.unlock();
-            cv_pop.notify_one();
-            return true;
-        }
-
-
-        // 支持左值
-        bool push(const T& val){
-            std::unique_lock<std::mutex> lock(m);
-            cv_push.wait(lock, [this] {return q.size() < max_size || stop_flag;});
-
-            if (stop_flag) return false;
-
-            q.push(val);
-            lock.unlock();
-            cv_pop.notify_one();
-            return true;
-        }
-
-        bool pop(T& val) {
-            std::unique_lock<std::mutex> lock(m);
-            cv_pop.wait(lock, [this] { return !q.empty() || stop_flag; }); // 等待队列非空或者收到停止信号
-            if (stop_flag && q.empty()) return false;
-            val = std::move(q.front()); // 取出队列头元素
-            q.pop(); // pop 后才释放锁，确保生产者在 push 后能第一时间看到队列状态的改变
-            lock.unlock();
-            cv_push.notify_one(); // 条件变量中的 lambda 表达式，并不是在后台时刻不停地被监控着 所以需要pop之后手动通知生产者线程，唤醒他们继续生产
-            return true;
-        }
-
-        void stop() {
-            std::unique_lock<std::mutex> lock(m);
-            stop_flag = true; // 设置停止标志，通知所有等待线程
-            lock.unlock();
-            cv_push.notify_all(); // 唤醒所有等待生产的线程
-            cv_pop.notify_all(); // 唤醒所有等待消费的线程
-        }
-    };
 
 
     // TRT 日志器
@@ -211,6 +119,8 @@ namespace yolo {
             std::vector<TensorInfo> io_tensors;
             std::vector<uint8_t*> d_img_buffers;  // 指向每张图原数据显存的指针列表
             uint8_t** d_img_ptrs = nullptr;  // GPU 端的指针目录
+            int* d_img_widths = nullptr; // GPU端预处理核函数需要的输入图像宽度列表
+            int* d_img_heights = nullptr; // GPU端预处理核函数需要的输入图像高度列表
             int max_src_bytes = 0; 
             int input_width;
             int input_height;
@@ -247,6 +157,8 @@ namespace yolo {
                     if (ptr) { cudaFree(ptr); ptr = nullptr; }
                 }
                 if (d_img_ptrs) { cudaFree(d_img_ptrs); d_img_ptrs = nullptr; }
+                if (d_img_widths) { cudaFree(d_img_widths); d_img_widths = nullptr; }
+                if (d_img_heights) { cudaFree(d_img_heights); d_img_heights = nullptr; }
 
                 if (stream) { cudaStreamDestroy(stream); stream = nullptr; }
 
@@ -394,6 +306,8 @@ namespace yolo {
 
                     max_src_bytes = 1920 * 1080 * 3;
                     if (cudaMalloc((void **)&d_img_ptrs, max_batch_size * sizeof(uint8_t*)) != cudaSuccess) throw std::runtime_error("d_img_ptrs 失败");
+                    if (cudaMalloc((void **)&d_img_widths, max_batch_size * sizeof(int)) != cudaSuccess) throw std::runtime_error("d_img_widths 失败");
+                    if (cudaMalloc((void **)&d_img_heights, max_batch_size * sizeof(int)) != cudaSuccess) throw std::runtime_error("d_img_heights 失败");
                     d_img_buffers.resize(max_batch_size, nullptr);
                     for (int i = 0; i < max_batch_size; i++) {
                         if (cudaMalloc((void**)&d_img_buffers[i], max_src_bytes) != cudaSuccess) throw std::runtime_error("d_img_buffers 失败");
@@ -654,41 +568,9 @@ namespace yolo {
                 return batch_dets;
             }
 
-            // draw rectangle
-            void draw_results(cv::Mat& img, const BatchResult& res){
-                for (size_t i = 0; i < res.size(); i++){
-                    // static_cast 杜绝隐式转换警告
-                    int x1 = static_cast<int>(std::round(res[i].box.x1));
-                    int y1 = static_cast<int>(std::round(res[i].box.y1));
-                    int x2 = static_cast<int>(std::round(res[i].box.x2));
-                    int y2 = static_cast<int>(std::round(res[i].box.y2));
-
-                    x1 = std::max(0, std::min(x1, img.cols));
-                    y1 = std::max(0, std::min(y1, img.rows));
-                    x2 = std::max(0, std::min(x2, img.cols));
-                    y2 = std::max(0, std::min(y2, img.rows));
-
-                    int cls_id = res[i].class_id;
-                    float score = res[i].score;
-
-                    cv::Scalar color( (cls_id * 50) % 255, (cls_id * 100) % 255, (cls_id * 150) % 255 );
-                    cv::rectangle(img, cv::Point(x1, y1), cv::Point(x2, y2), color, 2);
-
-                    char score_str[8];
-                    snprintf(score_str, sizeof(score_str), "%.2f", score);
-                    // std::string label = (cls_id < (int)class_names.size() ? class_names[cls_id] : std::to_string(cls_id)) + ": " + score_str;
-                    std::string label = (cls_id >= 0 && cls_id < (int)class_names.size() ? class_names[cls_id] : std::to_string(cls_id)) + ": " + score_str;
-                    int baseLine;
-                    cv::Size labelSize = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &baseLine);
-                    // 如果顶部空间不够，就把标签挪到框的内部去画
-                    int label_y = (y1 - labelSize.height - 3 < 0) ? y1 + labelSize.height + 3 : y1;
-                    cv::rectangle(img, cv::Point(x1, label_y - labelSize.height - 3), cv::Point(x1 + labelSize.width, label_y), color, cv::FILLED);
-                    cv::putText(img, label, cv::Point(x1, label_y - 2), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
-                }
-            }
 
             // 实现接口 1：推理
-            std::pair<std::vector<BatchResult>, std::vector<float>> infer_batch(const std::vector<cv::Mat>& images) override {
+            std::pair<std::vector<BatchResult>, std::vector<float>> infer_batch(const std::vector<ImageView>& images) override {
                 int real_batch_size = images.size();
                 std::vector<float> scales;
                 std::vector<int> dws, dhs;
@@ -718,22 +600,23 @@ namespace yolo {
 
                 // --- 2. 动态维护原图显存池 (懒加载机制) ---
                 int max_current_bytes = 0;
-                std::vector<cv::Mat> continuous_imgs;
-                continuous_imgs.reserve(real_batch_size);
+
+                std::vector<const unsigned char*> host_img_ptrs;
+                std::vector<int> img_widths;
+                std::vector<int> img_heights;
+
+                // std::vector<cv::Mat> continuous_imgs;
+                // continuous_imgs.reserve(real_batch_size);
 
                 for (int b = 0; b < real_batch_size; b++) {
-                    cv::Mat img = images[b];
+                    int bytes = images[b].width * images[b].height * images[b].channels;
+                    if (bytes > max_current_bytes) max_current_bytes = bytes;
+
+                    host_img_ptrs.push_back(images[b].data);
+                    img_widths.push_back(images[b].width);
+                    img_heights.push_back(images[b].height);
                     
-                    // 必须检查！打破 OpenCV 的内存 Padding 陷阱，强制内存连续
-                    if (!img.isContinuous()) {
-                        img = img.clone();
-                    }
-                    continuous_imgs.push_back(img);
                     
-                    int bytes = img.cols * img.rows * input_channels;
-                    if (bytes > max_current_bytes) {
-                        max_current_bytes = bytes;
-                    }
                 }
 
                 // 如果遇到比以前更大的图，扩容 GPU 显存池
@@ -749,11 +632,12 @@ namespace yolo {
 
                 // d_img_buffers 存在显存复用， 做到零显存分配
                 launch_preprocess_cuda(
-                    continuous_imgs,
+                    host_img_ptrs, img_widths, img_heights,
                     trt_input_ptr,
                     input_width, input_height,
                     d_img_buffers,
                     d_img_ptrs,
+                    d_img_widths, d_img_heights,
                     scales, dws, dhs,   // <--- 这里接收返回值
                     stream
                 );
@@ -821,293 +705,7 @@ namespace yolo {
                 return {batch_dets, prof_times};
             }
 
-            // 实现接口 2：多线程流水线
-            void run(){
-                std::string source = config_.source;
-                int batch_size = opt_batch_size; // 按最优批次走
-                std::string save_dir = config_.save_dir;
-
-                if (config_.save) {
-                    fs::create_directories(save_dir);
-                }
-
-                if (fs::is_directory(source)){
-                    // === 模式 1: 目录图片多批次攒帧推理 保持串行，补充画框逻辑===
-                    std::vector<std::string> img_paths;
-                    for (const auto& entry : fs::directory_iterator(source)){
-                        std::string ext = entry.path().extension().string();
-                        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-                        if (std::find(IMAGE_EXTS.begin(), IMAGE_EXTS.end(), ext) != IMAGE_EXTS.end()){
-                            img_paths.push_back(entry.path().string());
-                        }
-                    }
-
-                    std::sort(img_paths.begin(), img_paths.end());
-
-                    std::cout << "找到 " << img_paths.size() << " 张图片，按照 opt_batch_size=" << batch_size << " 开始推理...\n";
-
-                    for (size_t i = 0; i < img_paths.size(); i += batch_size){
-                        std::vector<cv::Mat> valid_imgs;
-                        std::vector<std::string> valid_names;
-
-                        for (size_t j = i; j < std::min(i + batch_size, img_paths.size()); ++j){
-                            cv::Mat img = cv::imread(img_paths[j]);
-                            if (!img.empty()){
-                                valid_imgs.push_back(img);
-                                valid_names.push_back(fs::path(img_paths[j]).filename().string());
-                            }
-                        }
-
-                        if (valid_imgs.empty()) continue;
-
-                        auto t1 = std::chrono::high_resolution_clock::now();
-                        auto [batch_dets, prof] = infer_batch(valid_imgs);
-                        auto t2 = std::chrono::high_resolution_clock::now();
-                        double t = std::chrono::duration<double, std::milli>(t2 - t1).count();
-
-                        // 手动画框并保存
-                        for (size_t k = 0; k < valid_imgs.size(); ++k){
-                            if (!config_.no_draw) draw_results(valid_imgs[k], batch_dets[k]);
-                            if (config_.save) cv::imwrite((fs::path(save_dir)/valid_names[k]).string(), valid_imgs[k]);
-                        }
-
-
-                        // if (args.profile){
-                        //     printf("[Profile] H2D: %.2fms | Compute: %.2fms | D2H: %.2fms\n", prof[0], prof[1], prof[2]);
-                        // }
-                        if (profile){
-                            if (noend) {
-                                printf("[Profile] Preprocess(H2D+Kernel): %.2fms | Compute: %.2fms | Postprocess(D2H+kernel): %.2fms\n", 
-                                prof[0], prof[1], prof[3]);
-                            }
-                            else {
-                                printf("[Profile] Preprocess(H2D+Kernel): %.2fms | Compute: %.2fms | D2H: %.2fms | Postprocess: %.2fms\n", 
-                                prof[0], prof[1], prof[2], prof[3]);
-                            }
-                        }
-                        std::cout << "已处理进度: " << std::min(i + batch_size, img_paths.size()) << "/" << img_paths.size()
-                                << " | Batch总耗时: " << std::fixed << std::setprecision(2) << t << "ms\n";
-                    }
-                    std::cout << "✅ 目录处理完成。\n";
-                }else{
-                    std::string ext = fs::path(source).extension().string();
-                    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-                    bool is_image = std::find(IMAGE_EXTS.begin(), IMAGE_EXTS.end(), ext) != IMAGE_EXTS.end();
-
-                    if (is_image){
-                        // === 模式 2: 单张图片推理 (保持串行)===
-                        cv::Mat img = cv::imread(source);
-                        if (img.empty()) return;
-
-                        auto t1 = std::chrono::high_resolution_clock::now();
-                        auto [batch_dets, prof] = infer_batch({img});
-                        auto t2 = std::chrono::high_resolution_clock::now();
-                        double t = std::chrono::duration<double, std::milli>(t2 - t1).count();
-                        if (!config_.no_draw) draw_results(img, batch_dets[0]);
-                        if (config_.save) cv::imwrite((fs::path(save_dir)/fs::path(source).filename()).string(), img);
-
-                        // if (args.profile) printf("[Profile] H2D: %.2fms | Compute: %.2fms | D2H: %.2fms\n", prof[0], prof[1], prof[2]);
-                        if (profile){
-                            if (noend) {
-                                printf("[Profile] Preprocess(H2D+Kernel): %.2fms | Compute: %.2fms | Postprocess(D2H+kernel): %.2fms\n", 
-                                prof[0], prof[1], prof[3]);
-                            }
-                            else {
-                                printf("[Profile] Preprocess(H2D+Kernel): %.2fms | Compute: %.2fms | D2H: %.2fms | Postprocess: %.2fms\n", 
-                                prof[0], prof[1], prof[2], prof[3]);
-                            }
-                        }
-                        std::cout << "推理时间: " << t << "ms, 结果已保存\n";
-                    }
-                    else {
-                        // === 模式 3: 视频/RTSP 攒帧加速推理 ===
-                        cv::VideoCapture cap;
-                        bool is_digit = !source.empty() && std::all_of(source.begin(), source.end(), ::isdigit);
-                        if (is_digit) cap.open(std::stoi(source));
-                        else cap.open(source);
-                        if (!cap.isOpened()) return;
-
-                        int width = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_WIDTH));
-                        int height = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_HEIGHT));
-                        // double fps = cap.get(cv::CAP_PROP_FPS);
-                        // if (fps == 0.0) fps = 25.0;
-
-                        double fps = cap.get(cv::CAP_PROP_FPS);
-                        if (fps <= 0.0 || std::isnan(fps) || std::isinf(fps)){
-                            std::cout << "[警告] 无法获取真实 FPS，强制使用默认值 25.0\n";
-                            fps = 25.0;
-                        }
-
-                        cv::VideoWriter out_writer;
-                        bool is_file = fs::exists(source);
-                        if (is_file && config_.save){
-                            std::string save_path = (fs::path(save_dir)/fs::path(source).filename()).string();
-                            out_writer.open(save_path, cv::VideoWriter::fourcc('m', 'p', '4', 'v'), fps, cv::Size(width, height));
-                            std::cout << "视频开始处理，按 opt_batch=" << batch_size << " 攒批...\n";
-                        }
-
-
-                        /*
-                        为什么使用 std::atomic<bool>？
-                        在多线程环境中，多个线程可能会同时访问和修改同一个变量。如果这个变量是一个普通的 bool 类型，那么在没有适当的同步机制（如互斥锁）的情况下，可能会导致数据竞争
-                        另外编译阶段使用了-O3优化选项，编译器可能会对普通的 bool 变量进行寄存器优化，每次循环只检查寄存器里的值。导致一个线程修改了这个变量的值，但其他线程可能无法及时看到这个更新，从而无法正确响应停止信号。
-                        atomic 告诉编译器：“这个变量随时可能被别的线程暗改！你绝对不许把它优化到寄存器里。每次读它，都必须老老实实去主内存（或多核共享缓存）里拿最新的一手数据！
-                        */
-                        std::atomic<bool> pipeline_stop{false}; // 线程安全的停止信号
-                        // 创建两个管道缓冲队列 容量为3
-                        SafeQueue<PipelineData> in_queue(3);
-                        SafeQueue<PipelineData> out_queue(3);
-
-                        // ----------------------------------------------------
-                        // 🧵 线程 1: Reader (专职读图，IO 密集型)
-                        // ----------------------------------------------------
-                        std::thread reader_thread([&](){
-                            std::vector<cv::Mat> batch_frames;
-                            cv::Mat frame;
-                            while (!pipeline_stop && cap.read(frame)){ // 只要读到帧且没有停止信号，就不断的往队列里面放数据
-                                batch_frames.push_back(frame.clone());
-                                if (batch_frames.size() == static_cast<size_t>(batch_size)){ // 凑够一个批次的图片就推送入队列
-                                    PipelineData data;
-                                    // 使用swap而不是直接赋值
-                                    // data.frames = batch_frames;
-                                    std::swap(data.frames, batch_frames);
-                                    // 使用右值传入，触发移动语义，避免不必要的复制
-                                    // in_queue.push(data);
-                                    in_queue.push(std::move(data));
-                                    // batch_frames.clear();
-                                    // swap之后batch_frames是空的，直接reserve就行了
-                                    batch_frames.reserve(batch_size);
-                                }
-                            }
-                            if (!batch_frames.empty() && !pipeline_stop){ // 尾部不足一个批次的残余帧也送入队列
-                                PipelineData data;
-                                // data.frames = batch_frames;
-                                std::swap(data.frames, batch_frames);
-                                // 右值传人，同理
-                                in_queue.push(std::move(data));
-                            }
-
-                            // 读完了，发个空包当结束信号
-
-                            if (!pipeline_stop){
-                                PipelineData end_data;
-                                end_data.is_last = true;
-                                in_queue.push(std::move(end_data));
-                            }
-                        });
-
-
-                        // ----------------------------------------------------
-                        // 🧵 线程 2: Worker (专职调用 TRT，GPU 计算密集型)
-                        // ----------------------------------------------------
-                        std::thread worker_thread([&](){
-                            PipelineData data;
-                            while (in_queue.pop(data)){
-                                if (pipeline_stop) break;
-                                if (data.is_last){
-                                    out_queue.push(std::move(data)); // 击鼓传花，把结束信号传给主线程
-                                    break;
-                                }
-                                auto t1 = std::chrono::high_resolution_clock::now();
-                                auto [dets, prof] = infer_batch(data.frames);
-                                auto t2 = std::chrono::high_resolution_clock::now();
-
-                                data.dets = std::move(dets);
-                                data.prof = std::move(prof);
-                                data.batch_time = std::chrono::duration<double, std::milli>(t2 - t1).count();
-                                out_queue.push(std::move(data));
-                            }
-                        });
-
-                        // ----------------------------------------------------
-                        // 🧵 主线程: Writer (专职画框、显示、写硬盘)
-                        // ----------------------------------------------------
-
-
-                        int frame_count = 0;
-                        PipelineData out_data;
-                        
-                        auto last_pop_time = std::chrono::high_resolution_clock::now();
-                        auto global_start_time = last_pop_time;
-
-                        while (out_queue.pop(out_data)){
-                            if (out_data.is_last) break;
-
-                            auto current_pop_time = std::chrono::high_resolution_clock::now();
-                            double pipeline_batch_time = std::chrono::duration<double, std::milli>(current_pop_time - last_pop_time).count();
-                            last_pop_time = current_pop_time; // 更新打点
-
-                            // 1. 真实的端到端流水线 FPS
-                            double true_fps = 1000.0 / (pipeline_batch_time / out_data.frames.size());
-                            // 2. GPU 纯算力 FPS
-                            double gpu_fps = 1000.0 / (out_data.batch_time / out_data.frames.size());
-
-
-                            if (profile){
-                                const auto& prof = out_data.prof;
-                                if (noend) {
-                                    printf("[Profile] Preprocess(H2D+Kernel): %.2fms | Compute: %.2fms | Postprocess(D2H+kernel): %.2fms\n", 
-                                    prof[0], prof[1], prof[3]);
-                                }
-                                else {
-                                    printf("[Profile] Preprocess(H2D+Kernel): %.2fms | Compute: %.2fms | D2H: %.2fms | Postprocess: %.2fms\n", 
-                                    prof[0], prof[1], prof[2], prof[3]);
-                                }
-                            }
-
-                            for (size_t i = 0; i < out_data.frames.size(); i++){
-                                if (!config_.no_draw){
-                                    // 1. 画框
-                                    draw_results(out_data.frames[i], out_data.dets[i]);
-
-                                    // 2. 显示FPS
-                                    char fps_text[128];
-                                    snprintf(fps_text, sizeof(fps_text), "SYS FPS: %.1f | GPU FPS: %.1f", true_fps, gpu_fps);
-                                    cv::putText(out_data.frames[i], fps_text, cv::Point(20, 40),
-                                                cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 0, 255), 2);
-                                }
-                                
-                                // 3. 写入视频与显示
-                                if (out_writer.isOpened()) out_writer.write(out_data.frames[i]);
-                                if (!config_.no_show){
-                                    cv::imshow("TRT C++ Pipeline", out_data.frames[i]);
-                                    if (cv::waitKey(1) == 'q') {
-                                        pipeline_stop = true;
-                                        in_queue.stop(); out_queue.stop(); // 优雅关闭线程
-                                        break;
-                                    }
-                                }
-                            }
-
-                            if (pipeline_stop) break;
-
-                            frame_count += out_data.frames.size();
-                            if (frame_count % (batch_size * 5) == 0) {
-                                std::cout << "已处理 " << frame_count << " 帧 | "
-                                        << "GPU 耗时: " << std::fixed << std::setprecision(1) << out_data.batch_time << "ms | "
-                                        << "流水线节拍耗时: " << pipeline_batch_time << "ms\n";
-                            }
-                        }
-
-                        // ----------------------------------------------------
-                        // 🪦 打扫战场
-                        // ----------------------------------------------------
-                        auto global_end_time = std::chrono::high_resolution_clock::now();
-                        double total_seconds = std::chrono::duration<double>(global_end_time - global_start_time).count();
-
-                        reader_thread.join();
-                        worker_thread.join();
-                        cap.release();
-                        if (out_writer.isOpened()) out_writer.release();
-                        cv::destroyAllWindows();
-                        std::cout << "\n=========================================\n";
-                        std::cout << "✅ 视频多线程检测完毕。\n";
-                        std::cout << "处理总帧数: " << frame_count << " 帧\n";
-                        std::cout << "系统平均总吞吐量: " << frame_count / total_seconds << " FPS\n";
-                        std::cout << "=========================================\n";
-                    }
-                }
-            }
+            
 
     };
 

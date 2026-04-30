@@ -4,7 +4,6 @@
 #include <string>
 #include <memory>
 
-#include <opencv2/opencv.hpp>
 
 
 namespace yolo{
@@ -37,6 +36,14 @@ namespace yolo{
         int class_id;
     };
 
+    // 纯 C++ 结构的图像数据容器，完美替代 cv::Mat
+    struct ImageView {
+        const unsigned char* data; // 指向 BGR 像素的裸指针
+        int width;
+        int height;
+        int channels = 3;
+    };
+
 
     using BatchResult = std::vector<BoundingBox>;
 
@@ -45,10 +52,10 @@ namespace yolo{
             virtual ~IYoloDetector() = default;
 
             // 核心接口 1：传入多张图片，返回检测结果
-            virtual std::pair<std::vector<BatchResult>, std::vector<float>> infer_batch(const std::vector<cv::Mat>& images) = 0;
+            virtual std::pair<std::vector<BatchResult>, std::vector<float>> infer_batch(const std::vector<ImageView>& images) = 0;
 
-            // 核心接口 2：处理视频流流水线 (传入视频路径/摄像头索引)
-            virtual void run() = 0;
+            // // 核心接口 2：处理视频流流水线 (传入视频路径/摄像头索引)
+            // virtual void run() = 0;
 
     };
 

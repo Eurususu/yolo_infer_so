@@ -84,34 +84,35 @@ __global__ void preprocess_kernel(
 
 
 void launch_preprocess_cuda(
-    const std::vector<cv::Mat>& image_list,
+    const std::vector<const unsigned char*>& host_img_ptrs, 
+    const std::vector<int>& img_widths, 
+    const std::vector<int>& img_heights,
     float* d_dst_blob,
     int dst_w, int dst_h,
     const std::vector<uint8_t*>& d_img_buffers,
     uint8_t** d_img_ptrs,
+    int* d_image_widths, // 新增：由外部传入预分配好的显存！
+    int* d_image_heights, // 新增：由外部传入预分配好的显存！
     std::vector<float>& out_scales,
     std::vector<int>& out_dws,
     std::vector<int>& out_dhs,
     cudaStream_t stream
 )
 {
-    int batch_size = image_list.size();
+    int batch_size = host_img_ptrs.size();
 
     out_scales.resize(batch_size);
     out_dws.resize(batch_size);
     out_dhs.resize(batch_size);
 
-    std::vector<int>h_image_widths(batch_size);
-    std::vector<int>h_image_heights(batch_size);
-    // std::vector<uint8_t*>h_img_ptrs(batch_size);
 
     for (int b = 0; b < batch_size; ++b){
-        int src_w = image_list[b].cols;
-        int src_h = image_list[b].rows;
+        // 1. 直接从传入的纯 C++ 参数获取宽高
+        int src_w = img_widths[b];
+        int src_h = img_heights[b];
 
-        h_image_widths[b] = src_w;
-        h_image_heights[b] = src_h;
 
+        // 2. CPU 端计算 scale 和 padding
         float scale = std::min((float)dst_h / src_h, (float)dst_w / src_w);
         int new_w = static_cast<int>(std::round(src_w * scale));
         int new_h = static_cast<int>(std::round(src_h * scale));
@@ -125,7 +126,7 @@ void launch_preprocess_cuda(
         // 拷贝图片数据到gpu
         cudaMemcpyAsync(
             d_img_buffers[b],
-            image_list[b].ptr<uint8_t>(),
+            host_img_ptrs[b],
             src_w * src_h * 3,
             cudaMemcpyHostToDevice,
             stream
@@ -133,13 +134,10 @@ void launch_preprocess_cuda(
 
     }
 
-    int *d_image_widths = nullptr, *d_image_heights = nullptr;
-    cudaMalloc((void**)&d_image_widths, batch_size * sizeof(int));
-    cudaMalloc((void**)&d_image_heights, batch_size * sizeof(int));
 
     // 将宽、高数组，以及指针目录拷贝进 GPU
-    cudaMemcpyAsync(d_image_widths, h_image_widths.data(), batch_size * sizeof(int), cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(d_image_heights, h_image_heights.data(), batch_size * sizeof(int), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_image_widths, img_widths.data(), batch_size * sizeof(int), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_image_heights, img_heights.data(), batch_size * sizeof(int), cudaMemcpyHostToDevice, stream);
     // 拷贝显存地址到gpu
     cudaMemcpyAsync(d_img_ptrs, d_img_buffers.data(), batch_size * sizeof(uint8_t*), cudaMemcpyHostToDevice, stream);
 
@@ -156,11 +154,5 @@ void launch_preprocess_cuda(
         d_image_widths, d_image_heights, 
         dst_w, dst_h, batch_size
     );
-    cudaStreamSynchronize(stream);
-
-    // 释放临时元数据显存...
-    // 彻底销毁/归还 显存
-    cudaFreeAsync(d_image_widths, stream);
-    cudaFreeAsync(d_image_heights, stream);
 
 }
